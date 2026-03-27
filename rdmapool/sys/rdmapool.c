@@ -35,6 +35,7 @@
  * SUCH DAMAGE.
  */
 #include "rdmapool.h"
+#include <initguid.h>
 #include "rdmapool_interface.h"
 
 #ifdef ALLOC_PRAGMA

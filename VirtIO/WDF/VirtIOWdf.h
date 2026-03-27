@@ -64,6 +64,13 @@ typedef struct virtio_wdf_driver {
 
     BOOLEAN IsIoMmuActive;
 
+    /* Restricted DMA Pool support */
+    WDFIOTARGET RdmaPoolTarget;        /* I/O target to rdmapool device */
+    BOOLEAN UseRestrictedDma;          /* TRUE when using rdmapool for DMA */
+    PVOID RdmaPoolBaseVA;              /* Cached pool base virtual address */
+    PHYSICAL_ADDRESS RdmaPoolBasePA;   /* Cached pool base physical address */
+    SIZE_T RdmaPoolSize;               /* Cached pool size */
+
 } VIRTIO_WDF_DRIVER, *PVIRTIO_WDF_DRIVER;
 
 /* Queue discovery callbacks used by VirtIOWdfInitQueuesCB. */
@@ -136,6 +143,10 @@ UCHAR VirtIOWdfGetISRStatus(PVIRTIO_WDF_DRIVER pWdfDriver);
  */
 void VirtIOWdfDeviceGet(PVIRTIO_WDF_DRIVER pWdfDriver, ULONG offset, PVOID buf, ULONG len);
 void VirtIOWdfDeviceSet(PVIRTIO_WDF_DRIVER pWdfDriver, ULONG offset, CONST PVOID buf, ULONG len);
+
+/* Restricted DMA Pool support */
+NTSTATUS VirtIOWdfRdmaPoolConnect(PVIRTIO_WDF_DRIVER pWdfDriver, WDFDEVICE Device);
+void VirtIOWdfRdmaPoolDisconnect(PVIRTIO_WDF_DRIVER pWdfDriver);
 
 /* DMA memory allocations */
 
