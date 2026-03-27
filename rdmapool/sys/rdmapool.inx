@@ -1,0 +1,84 @@
+;
+; rdmapool.inf - Restricted DMA Pool Driver INF
+;
+; Copyright (c) 2024
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderString%
+CatalogFile = rdmapool.cat
+DriverVer   = 01/01/2024,1.0.0.0
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir = %INX_PLATFORM_DRIVERS_DIR%
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rdmapool.sys = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%StdMfg% = Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%RdmaPool.DeviceDesc% = RdmaPool_Device, ACPI\RDMA0001
+%RdmaPool.DeviceDesc% = RdmaPool_Device, Root\RDMAPool
+
+[RdmaPool_Device.NT]
+CopyFiles = RdmaPool_CopyFiles
+
+[RdmaPool_CopyFiles]
+rdmapool.sys
+
+;*****************************************
+; Service installation
+;*****************************************
+
+[RdmaPool_Device.NT.Services]
+AddService = rdmapool,%SPSVCINST_ASSOCSERVICE%,RdmaPool_Service_Inst
+
+[RdmaPool_Service_Inst]
+DisplayName    = %RdmaPool.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %INX_PLATFORM_DRIVERS_DIR%\rdmapool.sys
+
+[RdmaPool_Device.NT.HW]
+AddReg = RdmaPool_AddReg
+
+[RdmaPool_AddReg]
+HKR,Interrupt Management,,0x00000010
+HKR,Interrupt Management\MessageSignaledInterruptProperties,,0x00000010
+HKR,Interrupt Management\MessageSignaledInterruptProperties,MSISupported,0x00010001,0
+
+;*****************************************
+; WDF Section
+;*****************************************
+
+[RdmaPool_Device.NT.Wdf]
+KmdfService = rdmapool, RdmaPool_wdfsect
+
+[RdmaPool_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+;*****************************************
+; Strings
+;*****************************************
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderString         = "KVM Guest Drivers"
+StdMfg                 = "Restricted DMA Pool"
+DiskName               = "Restricted DMA Pool Driver Installation Disk"
+RdmaPool.DeviceDesc    = "Restricted DMA Pool Manager"
+RdmaPool.SVCDESC       = "Restricted DMA Pool Manager Service"
