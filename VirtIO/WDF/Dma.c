@@ -34,9 +34,204 @@
 #include "VirtIOWdf.h"
 #include "private.h"
 #include <devpropdef.h>
+#include <initguid.h>
+#include "rdmapool_interface.h"
 
 static EVT_WDF_OBJECT_CONTEXT_DESTROY OnDmaTransactionDestroy;
 static EVT_WDF_PROGRAM_DMA OnDmaTransactionProgramDma;
+
+/* ========================================================================
+ * Restricted DMA Pool Client Functions
+ * ======================================================================== */
+
+static void *RdmaPoolClientAllocate(PVIRTIO_WDF_DRIVER pWdfDriver, size_t size,
+                                    PHYSICAL_ADDRESS *ppa)
+{
+    RDMAPOOL_ALLOCATE_INPUT input;
+    RDMAPOOL_ALLOCATE_OUTPUT output;
+    WDF_MEMORY_DESCRIPTOR inputDesc, outputDesc;
+    NTSTATUS status;
+
+    if (!pWdfDriver->RdmaPoolTarget) {
+        return NULL;
+    }
+
+    RtlZeroMemory(&input, sizeof(input));
+    RtlZeroMemory(&output, sizeof(output));
+    input.RequestedSize = size;
+
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inputDesc, &input, sizeof(input));
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&outputDesc, &output, sizeof(output));
+
+    status = WdfIoTargetSendIoctlSynchronously(
+        pWdfDriver->RdmaPoolTarget,
+        NULL,
+        IOCTL_RDMAPOOL_ALLOCATE,
+        &inputDesc,
+        &outputDesc,
+        NULL,
+        NULL);
+
+    if (!NT_SUCCESS(status) || !output.VirtualAddress) {
+        DPrintf(0, "%s FAILED status=%X\n", __FUNCTION__, status);
+        return NULL;
+    }
+
+    ppa->QuadPart = output.PhysicalAddress.QuadPart;
+    DPrintf(1, "%s: VA=%p PA=%I64X size=%IX\n", __FUNCTION__,
+            output.VirtualAddress, output.PhysicalAddress.QuadPart, output.AllocatedSize);
+    return output.VirtualAddress;
+}
+
+static NTSTATUS RdmaPoolClientFree(PVIRTIO_WDF_DRIVER pWdfDriver, void *va)
+{
+    RDMAPOOL_FREE_INPUT input;
+    WDF_MEMORY_DESCRIPTOR inputDesc;
+    NTSTATUS status;
+
+    if (!pWdfDriver->RdmaPoolTarget) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    RtlZeroMemory(&input, sizeof(input));
+    input.VirtualAddress = va;
+
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inputDesc, &input, sizeof(input));
+
+    status = WdfIoTargetSendIoctlSynchronously(
+        pWdfDriver->RdmaPoolTarget,
+        NULL,
+        IOCTL_RDMAPOOL_FREE,
+        &inputDesc,
+        NULL,
+        NULL,
+        NULL);
+
+    if (!NT_SUCCESS(status)) {
+        DPrintf(0, "%s FAILED status=%X va=%p\n", __FUNCTION__, status, va);
+    }
+    return status;
+}
+
+static BOOLEAN IsInRdmaPool(PVIRTIO_WDF_DRIVER pWdfDriver, void *va)
+{
+    ULONG_PTR vaAddr = (ULONG_PTR)va;
+    ULONG_PTR poolStart = (ULONG_PTR)pWdfDriver->RdmaPoolBaseVA;
+    ULONG_PTR poolEnd = poolStart + pWdfDriver->RdmaPoolSize;
+    return pWdfDriver->UseRestrictedDma && pWdfDriver->RdmaPoolBaseVA &&
+           vaAddr >= poolStart && vaAddr < poolEnd;
+}
+
+static PHYSICAL_ADDRESS GetRdmaPoolPhysicalAddress(PVIRTIO_WDF_DRIVER pWdfDriver, void *va)
+{
+    PHYSICAL_ADDRESS pa;
+    ULONG_PTR offset = (ULONG_PTR)va - (ULONG_PTR)pWdfDriver->RdmaPoolBaseVA;
+    pa.QuadPart = pWdfDriver->RdmaPoolBasePA.QuadPart + offset;
+    return pa;
+}
+
+/*
+ * Connect to the rdmapool device via its device interface.
+ * On success, sets UseRestrictedDma=TRUE and caches pool info.
+ */
+NTSTATUS VirtIOWdfRdmaPoolConnect(PVIRTIO_WDF_DRIVER pWdfDriver, WDFDEVICE Device)
+{
+    NTSTATUS status;
+    PWSTR deviceList = NULL;
+    UNICODE_STRING symbolicLink;
+    WDFIOTARGET ioTarget = NULL;
+    WDF_IO_TARGET_OPEN_PARAMS openParams;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    RDMAPOOL_QUERY_POOL_OUTPUT poolInfo;
+    WDF_MEMORY_DESCRIPTOR outputDesc;
+
+    /* Find the rdmapool device interface */
+    status = IoGetDeviceInterfaces(&GUID_DEVINTERFACE_RDMA_POOL, NULL, 0, &deviceList);
+    if (!NT_SUCCESS(status) || !deviceList || !deviceList[0]) {
+        DPrintf(0, "%s: RDMAPool device not found (status=%X)\n", __FUNCTION__, status);
+        if (deviceList) {
+            ExFreePool(deviceList);
+        }
+        return STATUS_NOT_FOUND;
+    }
+
+    /* Use the first device interface found */
+    RtlInitUnicodeString(&symbolicLink, deviceList);
+    DPrintf(0, "%s: Found RDMAPool device: %wZ\n", __FUNCTION__, &symbolicLink);
+
+    /* Create and open WDF I/O target */
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = Device;
+    status = WdfIoTargetCreate(Device, &attributes, &ioTarget);
+    if (!NT_SUCCESS(status)) {
+        DPrintf(0, "%s: WdfIoTargetCreate failed=%X\n", __FUNCTION__, status);
+        ExFreePool(deviceList);
+        return status;
+    }
+
+    WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(&openParams, &symbolicLink,
+                                                 FILE_ALL_ACCESS);
+    openParams.ShareAccess = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    status = WdfIoTargetOpen(ioTarget, &openParams);
+    ExFreePool(deviceList);
+
+    if (!NT_SUCCESS(status)) {
+        DPrintf(0, "%s: WdfIoTargetOpen failed=%X\n", __FUNCTION__, status);
+        WdfObjectDelete(ioTarget);
+        return status;
+    }
+
+    /* Query pool information */
+    RtlZeroMemory(&poolInfo, sizeof(poolInfo));
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&outputDesc, &poolInfo, sizeof(poolInfo));
+
+    status = WdfIoTargetSendIoctlSynchronously(
+        ioTarget,
+        NULL,
+        IOCTL_RDMAPOOL_QUERY_POOL,
+        NULL,
+        &outputDesc,
+        NULL,
+        NULL);
+
+    if (!NT_SUCCESS(status) || !poolInfo.BaseVirtualAddress || !poolInfo.PoolSize) {
+        DPrintf(0, "%s: Pool query failed=%X\n", __FUNCTION__, status);
+        WdfIoTargetClose(ioTarget);
+        WdfObjectDelete(ioTarget);
+        return NT_SUCCESS(status) ? STATUS_UNSUCCESSFUL : status;
+    }
+
+    /* Store connection and pool info */
+    pWdfDriver->RdmaPoolTarget = ioTarget;
+    pWdfDriver->UseRestrictedDma = TRUE;
+    pWdfDriver->RdmaPoolBaseVA = poolInfo.BaseVirtualAddress;
+    pWdfDriver->RdmaPoolBasePA = poolInfo.BasePhysicalAddress;
+    pWdfDriver->RdmaPoolSize = poolInfo.PoolSize;
+
+    DPrintf(0, "%s: Connected to RDMAPool, base VA=%p PA=%I64X size=%IX\n",
+            __FUNCTION__, pWdfDriver->RdmaPoolBaseVA,
+            pWdfDriver->RdmaPoolBasePA.QuadPart, pWdfDriver->RdmaPoolSize);
+
+    return STATUS_SUCCESS;
+}
+
+void VirtIOWdfRdmaPoolDisconnect(PVIRTIO_WDF_DRIVER pWdfDriver)
+{
+    if (pWdfDriver->RdmaPoolTarget) {
+        DPrintf(0, "%s: Disconnecting from RDMAPool\n", __FUNCTION__);
+        WdfIoTargetClose(pWdfDriver->RdmaPoolTarget);
+        WdfObjectDelete(pWdfDriver->RdmaPoolTarget);
+        pWdfDriver->RdmaPoolTarget = NULL;
+    }
+    pWdfDriver->UseRestrictedDma = FALSE;
+    pWdfDriver->RdmaPoolBaseVA = NULL;
+    pWdfDriver->RdmaPoolBasePA.QuadPart = 0;
+    pWdfDriver->RdmaPoolSize = 0;
+}
+
+/* ========================================================================
+ * DMA Memory Allocation (original + rdmapool path)
+ * ======================================================================== */
 
 static void *AllocateCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, size_t size, ULONG groupTag)
 {
@@ -44,12 +239,28 @@ static void *AllocateCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, size_t size, UL
     WDFCOMMONBUFFER commonBuffer;
     PVIRTIO_WDF_MEMORY_BLOCK_CONTEXT context;
     WDF_OBJECT_ATTRIBUTES attr;
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, VIRTIO_WDF_MEMORY_BLOCK_CONTEXT);
 
     if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
         DPrintf(0, "%s FAILED(irql)\n", __FUNCTION__);
         return NULL;
     }
+
+    /* Use restricted DMA pool if connected */
+    if (pWdfDriver->UseRestrictedDma && pWdfDriver->RdmaPoolTarget) {
+        PHYSICAL_ADDRESS pa;
+        void *va = RdmaPoolClientAllocate(pWdfDriver, size, &pa);
+        if (!va) {
+            DPrintf(0, "%s FAILED(rdmapool alloc)\n", __FUNCTION__);
+            return NULL;
+        }
+        DPrintf(1, "%s rdmapool: %p@%I64x(tag %08X), size 0x%x\n", __FUNCTION__,
+                va, pa.QuadPart, groupTag, (ULONG)size);
+        return va;
+    }
+
+    /* Standard WDF common buffer path */
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, VIRTIO_WDF_MEMORY_BLOCK_CONTEXT);
+
     status = WdfCommonBufferCreate(pWdfDriver->DmaEnabler, size, &attr, &commonBuffer);
     if (!NT_SUCCESS(status)) {
         return NULL;
@@ -89,6 +300,24 @@ static BOOLEAN FindCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, void *p, PHYSICAL
     ULONG_PTR va = (ULONG_PTR)p;
     ULONG i, n;
     WDFOBJECT obj = NULL;
+
+    /* Check if VA is in restricted DMA pool range */
+    if (IsInRdmaPool(pWdfDriver, p)) {
+        *ppa = pWdfDriver->RdmaPoolBasePA;
+        *pOffset = va - (ULONG_PTR)pWdfDriver->RdmaPoolBaseVA;
+        if (bRemoval) {
+            if (KeGetCurrentIrql() <= PASSIVE_LEVEL) {
+                RdmaPoolClientFree(pWdfDriver, p);
+                DPrintf(1, "%s rdmapool: freed %p\n", __FUNCTION__, p);
+            } else {
+                DPrintf(0, "%s rdmapool: cannot free at elevated IRQL\n", __FUNCTION__);
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }
+
+    /* Standard WDF common buffer lookup */
     WdfSpinLockAcquire(pWdfDriver->DmaSpinlock);
     n = WdfCollectionGetCount(pWdfDriver->MemoryBlockCollection);
     for (i = 0; i < n; ++i) {
@@ -137,6 +366,12 @@ static PHYSICAL_ADDRESS GetPhysicalAddress(PVIRTIO_WDF_DRIVER pWdfDriver, PVOID 
     PHYSICAL_ADDRESS pa;
     size_t offset;
     pa.QuadPart = 0;
+
+    /* Fast path for restricted DMA pool */
+    if (IsInRdmaPool(pWdfDriver, va)) {
+        return GetRdmaPoolPhysicalAddress(pWdfDriver, va);
+    }
+
     if (FindCommonBuffer(pWdfDriver, va, &pa, &offset, FALSE)) {
         pa.QuadPart += offset;
     }

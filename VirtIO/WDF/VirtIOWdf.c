@@ -97,6 +97,20 @@ NTSTATUS VirtIOWdfInitialize(PVIRTIO_WDF_DRIVER pWdfDriver, WDFDEVICE Device,
         status = VirtIOWdfDeviceCheckIOMMUActive(pWdfDriver, Device);
     }
 
+    /* Try to connect to restricted DMA pool driver.
+     * If the rdmapool device is available, DMA allocations will use it.
+     * If not available, fall back to standard WDF common buffer.
+     */
+    if (NT_SUCCESS(status)) {
+        NTSTATUS rdmaStatus = VirtIOWdfRdmaPoolConnect(pWdfDriver, Device);
+        if (NT_SUCCESS(rdmaStatus)) {
+            DPrintf(0, "%s: Using restricted DMA pool for allocations\n", __FUNCTION__);
+        } else {
+            DPrintf(0, "%s: Restricted DMA pool not available (status=%X), using standard DMA\n",
+                    __FUNCTION__, rdmaStatus);
+        }
+    }
+
     if (!NT_SUCCESS(status)) {
         PCIFreeBars(pWdfDriver);
     }
@@ -284,6 +298,8 @@ void VirtIOWdfSetDriverFailed(PVIRTIO_WDF_DRIVER pWdfDriver)
 
 NTSTATUS VirtIOWdfShutdown(PVIRTIO_WDF_DRIVER pWdfDriver)
 {
+    VirtIOWdfRdmaPoolDisconnect(pWdfDriver);
+
     virtio_device_shutdown(&pWdfDriver->VIODevice);
 
     PCIFreeBars(pWdfDriver);

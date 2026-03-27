@@ -32,7 +32,11 @@
  */
 #pragma once
 
-#include <initguid.h>
+/*
+ * NOTE: Include <initguid.h> BEFORE this header in exactly one .c file
+ * per binary to generate the GUID definition. Other .c files will get
+ * the extern declaration automatically.
+ */
 #include <ntddk.h>
 
 /* Device interface GUID for the Restricted DMA Pool driver.
