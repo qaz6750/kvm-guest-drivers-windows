@@ -113,23 +113,6 @@ static NTSTATUS RdmaPoolClientFree(PVIRTIO_WDF_DRIVER pWdfDriver, void *va)
     return status;
 }
 
-static BOOLEAN IsInRdmaPool(PVIRTIO_WDF_DRIVER pWdfDriver, void *va)
-{
-    ULONG_PTR vaAddr = (ULONG_PTR)va;
-    ULONG_PTR poolStart = (ULONG_PTR)pWdfDriver->RdmaPoolBaseVA;
-    ULONG_PTR poolEnd = poolStart + pWdfDriver->RdmaPoolSize;
-    return pWdfDriver->UseRestrictedDma && pWdfDriver->RdmaPoolBaseVA &&
-           vaAddr >= poolStart && vaAddr < poolEnd;
-}
-
-static PHYSICAL_ADDRESS GetRdmaPoolPhysicalAddress(PVIRTIO_WDF_DRIVER pWdfDriver, void *va)
-{
-    PHYSICAL_ADDRESS pa;
-    ULONG_PTR offset = (ULONG_PTR)va - (ULONG_PTR)pWdfDriver->RdmaPoolBaseVA;
-    pa.QuadPart = pWdfDriver->RdmaPoolBasePA.QuadPart + offset;
-    return pa;
-}
-
 /*
  * Connect to the rdmapool device via its device interface.
  * On success, sets UseRestrictedDma=TRUE and caches pool info.
@@ -248,11 +231,43 @@ static void *AllocateCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, size_t size, UL
     /* Use restricted DMA pool if connected */
     if (pWdfDriver->UseRestrictedDma && pWdfDriver->RdmaPoolTarget) {
         PHYSICAL_ADDRESS pa;
+        WDFOBJECT trackObj;
         void *va = RdmaPoolClientAllocate(pWdfDriver, size, &pa);
         if (!va) {
             DPrintf(0, "%s FAILED(rdmapool alloc)\n", __FUNCTION__);
             return NULL;
         }
+
+        /* Track the rdmapool allocation in MemoryBlockCollection
+         * using a WDF general object with our context type.
+         */
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, VIRTIO_WDF_MEMORY_BLOCK_CONTEXT);
+        status = WdfObjectCreate(&attr, &trackObj);
+        if (!NT_SUCCESS(status)) {
+            DPrintf(0, "%s FAILED(track obj) %X\n", __FUNCTION__, status);
+            RdmaPoolClientFree(pWdfDriver, va);
+            return NULL;
+        }
+
+        context = GetMemoryBlockContext(trackObj);
+        context->pVirtualAddress = va;
+        context->PhysicalAddress = pa;
+        context->WdfBuffer = NULL;
+        context->Length = size;
+        context->groupTag = groupTag;
+        context->bToBeDeleted = FALSE;
+        context->bFromRdmaPool = TRUE;
+
+        WdfSpinLockAcquire(pWdfDriver->DmaSpinlock);
+        status = WdfCollectionAdd(pWdfDriver->MemoryBlockCollection, trackObj);
+        if (!NT_SUCCESS(status)) {
+            WdfSpinLockRelease(pWdfDriver->DmaSpinlock);
+            WdfObjectDelete(trackObj);
+            RdmaPoolClientFree(pWdfDriver, va);
+            return NULL;
+        }
+        WdfSpinLockRelease(pWdfDriver->DmaSpinlock);
+
         DPrintf(1, "%s rdmapool: %p@%I64x(tag %08X), size 0x%x\n", __FUNCTION__,
                 va, pa.QuadPart, groupTag, (ULONG)size);
         return va;
@@ -279,6 +294,7 @@ static void *AllocateCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, size_t size, UL
     context->pVirtualAddress = WdfCommonBufferGetAlignedVirtualAddress(commonBuffer);
     context->groupTag = groupTag;
     context->bToBeDeleted = FALSE;
+    context->bFromRdmaPool = FALSE;
     WdfSpinLockRelease(pWdfDriver->DmaSpinlock);
     RtlZeroMemory(context->pVirtualAddress, size);
 
@@ -300,24 +316,8 @@ static BOOLEAN FindCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, void *p, PHYSICAL
     ULONG_PTR va = (ULONG_PTR)p;
     ULONG i, n;
     WDFOBJECT obj = NULL;
+    BOOLEAN bFromRdmaPool = FALSE;
 
-    /* Check if VA is in restricted DMA pool range */
-    if (IsInRdmaPool(pWdfDriver, p)) {
-        *ppa = pWdfDriver->RdmaPoolBasePA;
-        *pOffset = va - (ULONG_PTR)pWdfDriver->RdmaPoolBaseVA;
-        if (bRemoval) {
-            if (KeGetCurrentIrql() <= PASSIVE_LEVEL) {
-                RdmaPoolClientFree(pWdfDriver, p);
-                DPrintf(1, "%s rdmapool: freed %p\n", __FUNCTION__, p);
-            } else {
-                DPrintf(0, "%s rdmapool: cannot free at elevated IRQL\n", __FUNCTION__);
-                return FALSE;
-            }
-        }
-        return TRUE;
-    }
-
-    /* Standard WDF common buffer lookup */
     WdfSpinLockAcquire(pWdfDriver->DmaSpinlock);
     n = WdfCollectionGetCount(pWdfDriver->MemoryBlockCollection);
     for (i = 0; i < n; ++i) {
@@ -333,6 +333,7 @@ static BOOLEAN FindCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, void *p, PHYSICAL
         if (va >= currentVaStart && va < (currentVaStart + context->Length)) {
             *ppa = context->PhysicalAddress;
             *pOffset = va - currentVaStart;
+            bFromRdmaPool = context->bFromRdmaPool;
             b = TRUE;
             if (bRemoval) {
                 b = *pOffset == 0;
@@ -348,12 +349,18 @@ static BOOLEAN FindCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, void *p, PHYSICAL
         DPrintf(0, "%s(%s) FAILED!\n", __FUNCTION__, bRemoval ? "Remove" : "Locate");
     } else if (bRemoval) {
         if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            /* Free the rdmapool allocation before removing the tracking object */
+            if (bFromRdmaPool) {
+                RdmaPoolClientFree(pWdfDriver, p);
+            }
+
             WdfSpinLockAcquire(pWdfDriver->DmaSpinlock);
             WdfCollectionRemove(pWdfDriver->MemoryBlockCollection, obj);
             WdfSpinLockRelease(pWdfDriver->DmaSpinlock);
 
             WdfObjectDelete(obj);
-            DPrintf(1, "%s %p freed (%d common buffers)\n", __FUNCTION__, va, n - 1);
+            DPrintf(1, "%s %p freed%s (%d common buffers)\n", __FUNCTION__, va,
+                    bFromRdmaPool ? " (rdmapool)" : "", n - 1);
         } else {
             DPrintf(0, "%s %p marked for deletion\n", __FUNCTION__, va);
         }
@@ -366,12 +373,6 @@ static PHYSICAL_ADDRESS GetPhysicalAddress(PVIRTIO_WDF_DRIVER pWdfDriver, PVOID 
     PHYSICAL_ADDRESS pa;
     size_t offset;
     pa.QuadPart = 0;
-
-    /* Fast path for restricted DMA pool */
-    if (IsInRdmaPool(pWdfDriver, va)) {
-        return GetRdmaPoolPhysicalAddress(pWdfDriver, va);
-    }
-
     if (FindCommonBuffer(pWdfDriver, va, &pa, &offset, FALSE)) {
         pa.QuadPart += offset;
     }
@@ -393,6 +394,7 @@ void VirtIOWdfDeviceFreeDmaMemory(VirtIODevice *vdev, void *va)
 static BOOLEAN FindCommonBufferByTag(PVIRTIO_WDF_DRIVER pWdfDriver, ULONG tag)
 {
     BOOLEAN b = FALSE;
+    BOOLEAN bFromRdmaPool = FALSE;
     ULONG i, n;
     WDFOBJECT obj = NULL;
     PVIRTIO_WDF_MEMORY_BLOCK_CONTEXT context = NULL;
@@ -405,14 +407,18 @@ static BOOLEAN FindCommonBufferByTag(PVIRTIO_WDF_DRIVER pWdfDriver, ULONG tag)
         }
         context = GetMemoryBlockContext(obj);
         if (context->groupTag == tag) {
+            bFromRdmaPool = context->bFromRdmaPool;
             b = TRUE;
             break;
         }
     }
     WdfSpinLockRelease(pWdfDriver->DmaSpinlock);
     if (b) {
-        DPrintf(1, "%s %p (tag %08X) freed (%d common buffers)\n", __FUNCTION__,
-                context->pVirtualAddress, tag, n - 1);
+        DPrintf(1, "%s %p (tag %08X) freed%s (%d common buffers)\n", __FUNCTION__,
+                context->pVirtualAddress, tag, bFromRdmaPool ? " (rdmapool)" : "", n - 1);
+        if (bFromRdmaPool) {
+            RdmaPoolClientFree(pWdfDriver, context->pVirtualAddress);
+        }
         WdfSpinLockAcquire(pWdfDriver->DmaSpinlock);
         WdfCollectionRemove(pWdfDriver->MemoryBlockCollection, obj);
         WdfSpinLockRelease(pWdfDriver->DmaSpinlock);
