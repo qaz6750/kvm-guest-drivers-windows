@@ -75,6 +75,7 @@ typedef struct virtio_wdf_memory_block_context {
     size_t Length;
     ULONG groupTag;
     BOOLEAN bToBeDeleted;
+    BOOLEAN bFromRdmaPool;
 } VIRTIO_WDF_MEMORY_BLOCK_CONTEXT, *PVIRTIO_WDF_MEMORY_BLOCK_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(VIRTIO_WDF_MEMORY_BLOCK_CONTEXT, GetMemoryBlockContext)
