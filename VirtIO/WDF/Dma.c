@@ -359,10 +359,10 @@ static BOOLEAN FindCommonBuffer(PVIRTIO_WDF_DRIVER pWdfDriver, void *p, PHYSICAL
             WdfSpinLockRelease(pWdfDriver->DmaSpinlock);
 
             WdfObjectDelete(obj);
-            DPrintf(1, "%s %p freed%s (%d common buffers)\n", __FUNCTION__, va,
+            DPrintf(1, "%s %p freed%s (%d common buffers)\n", __FUNCTION__, (void *)va,
                     bFromRdmaPool ? " (rdmapool)" : "", n - 1);
         } else {
-            DPrintf(0, "%s %p marked for deletion\n", __FUNCTION__, va);
+            DPrintf(0, "%s %p marked for deletion\n", __FUNCTION__, (void *)va);
         }
     }
     return b;
